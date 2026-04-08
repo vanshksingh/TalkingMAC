@@ -25,6 +25,7 @@ SYSTEM_PROMPT: str = (
 
 # ── Voice ────────────────────────────────────────────────────────────────────
 WAKE_WORD: str      = os.getenv("WAKE_WORD", "hey mac")
+WAKE_WORD_INTERRUPTION_ENABLED: bool = os.getenv("WAKE_WORD_INTERRUPTION_ENABLED", "1").lower() not in {"0", "false", "no"}
 STT_ENGINE: str     = os.getenv("STT_ENGINE", "whisper")
 STT_WHISPER_MODEL: str = os.getenv("STT_WHISPER_MODEL", "small.en")
 STT_WHISPER_LANGUAGE: str = os.getenv("STT_WHISPER_LANGUAGE", "en")

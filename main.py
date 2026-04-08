@@ -28,7 +28,7 @@ log = logging.getLogger("talkingmac")
 # Ensure project root on path (needed for PyCharm + terminal)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import AI_BACKEND
+from config import AI_BACKEND, WAKE_WORD_INTERRUPTION_ENABLED
 from ui.app import TalkingMACApp
 from ui.expressions import Expression
 from ai.llm_manager import LLMManager
@@ -136,7 +136,7 @@ class TalkingMACAssistant:
             return  # drop duplicate wake events while one is being handled
 
         busy_now = self._busy.locked()
-        barge_in = busy_now or self._tts.is_speaking
+        barge_in = WAKE_WORD_INTERRUPTION_ENABLED and (busy_now or self._tts.is_speaking)
 
         if barge_in:
             log.info("Wake word during active response: requesting interruption")
@@ -203,6 +203,7 @@ class TalkingMACAssistant:
             return
 
         # ── Think (LLM generates full response) ──────────────────────────────
+        self._ui.set_look_target(0.0, -0.12)
         self._set_state(Expression.THINKING, "THINKING")
         self._ui.show_status("", ttl=0)
 
