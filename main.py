@@ -28,7 +28,7 @@ log = logging.getLogger("talkingmac")
 # Ensure project root on path (needed for PyCharm + terminal)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import AI_BACKEND, WAKE_WORD_INTERRUPTION_ENABLED
+from config import AI_BACKEND, IDLE_SLEEP_TIMEOUT_SECS, WAKE_WORD_INTERRUPTION_ENABLED
 from ui.app import TalkingMACApp
 from ui.expressions import Expression
 from ai.llm_manager import LLMManager
@@ -85,6 +85,11 @@ class TalkingMACAssistant:
         self._interrupt_requested = threading.Event()
         self._wake_lock = threading.Lock()
         self._wake_pause_depth = 0
+        self._activity_lock = threading.Lock()
+        self._last_activity_ts = time.monotonic()
+        self._sleeping = False
+        self._sleep_timeout_secs = max(0.0, IDLE_SLEEP_TIMEOUT_SECS)
+        self._stop_event = threading.Event()
 
     # ── Boot ──────────────────────────────────────────────────────────────────
 
@@ -104,6 +109,9 @@ class TalkingMACAssistant:
 
         # Greeting in background
         threading.Thread(target=self._greet, daemon=True).start()
+
+        # Auto-sleep face after idle timeout
+        threading.Thread(target=self._idle_sleep_loop, daemon=True).start()
 
         self._ui.set_mode_label("IDLE")
         log.info("TalkingMAC ready")
@@ -148,6 +156,7 @@ class TalkingMACAssistant:
             return  # already handling something
 
         try:
+            self._mark_activity()
             self._interrupt_requested.clear()
             self._ui.set_look_target(0.0, -0.3)
             self._ui.set_expression(Expression.HAPPY)
@@ -183,11 +192,20 @@ class TalkingMACAssistant:
     # ── Text input from keyboard ───────────────────────────────────────────────
 
     def _handle_text_input(self, text: str):
+        clean = text.strip()
+        if not clean:
+            return
+
+        if clean.lower() in {"/s", "/sleep"}:
+            self._set_sleep_face()
+            return
+
+        self._mark_activity()
         if not self._busy.acquire(blocking=False):
             self._ui.show_status("Still thinking… wait a moment", ttl=3)
             return
         try:
-            self._process_query(text)
+            self._process_query(clean)
         finally:
             self._busy.release()
 
@@ -195,6 +213,7 @@ class TalkingMACAssistant:
 
     def _process_query(self, user_text: str):
         log.info("Query: %r", user_text)
+        self._mark_activity()
         self._interrupt_requested.clear()
 
         if self._llm is None:
@@ -252,6 +271,44 @@ class TalkingMACAssistant:
         self._ui.set_expression(expr)
         self._ui.set_mode_label(label)
 
+    def _set_sleep_face(self):
+        with self._activity_lock:
+            self._sleeping = True
+            self._last_activity_ts = time.monotonic()
+        self._ui.set_look_target(0.0, 0.0)
+        self._set_state(Expression.SLEEPING, "SLEEP")
+
+    def _mark_activity(self):
+        should_wake_visual = False
+        with self._activity_lock:
+            self._last_activity_ts = time.monotonic()
+            if self._sleeping:
+                self._sleeping = False
+                should_wake_visual = True
+
+        # Wake the face only if we're not currently in another active state.
+        if should_wake_visual and not self._busy.locked() and not self._tts.is_speaking:
+            self._set_state(Expression.IDLE, "IDLE")
+
+    def _idle_sleep_loop(self):
+        while not self._stop_event.is_set():
+            if self._sleep_timeout_secs <= 0:
+                time.sleep(0.5)
+                continue
+
+            if self._busy.locked() or self._tts.is_speaking:
+                time.sleep(0.25)
+                continue
+
+            with self._activity_lock:
+                idle_for = time.monotonic() - self._last_activity_ts
+                should_sleep = idle_for >= self._sleep_timeout_secs and not self._sleeping
+
+            if should_sleep:
+                self._set_sleep_face()
+
+            time.sleep(0.25)
+
     def _pause_wake_detection(self):
         with self._wake_lock:
             self._wake_pause_depth += 1
@@ -282,6 +339,7 @@ class TalkingMACAssistant:
 
     def _shutdown(self):
         log.info("Shutting down…")
+        self._stop_event.set()
         self._ww.stop()
         self._capture.stop()
         self._tts.shutdown()

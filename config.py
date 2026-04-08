@@ -43,6 +43,7 @@ TTS_RATE: int       = int(os.getenv("TTS_RATE", "165"))
 TTS_VOLUME: float   = float(os.getenv("TTS_VOLUME", "0.9"))
 AMBIENT_DURATION: float = 1.0
 LISTEN_TIMEOUT: int = 8
+IDLE_SLEEP_TIMEOUT_SECS: float = float(os.getenv("IDLE_SLEEP_TIMEOUT_SECS", "60"))
 
 # ── UI ───────────────────────────────────────────────────────────────────────
 WINDOW_TITLE: str = "TalkingMAC"
