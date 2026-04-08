@@ -11,9 +11,12 @@ across two non-overlapping chunks.
 import collections
 import io
 import logging
+import queue
+import re
 import threading
 import time
-from typing import Callable, Optional
+from difflib import SequenceMatcher
+from typing import Any, Callable, Optional
 
 import numpy as np
 import soundfile as sf
@@ -26,7 +29,7 @@ log = logging.getLogger(__name__)
 WINDOW_SECS   = 3.0                          # rolling window size
 STEP_SECS     = 1.0                          # how often we run STT
 WINDOW_SAMPLES = int(WINDOW_SECS * SAMPLE_RATE)
-ENERGY_THRESH  = 0.003                       # skip STT on near-silence
+ENERGY_THRESH  = 0.0015                      # skip STT on near-silence
 
 
 class WakeWordDetector:
@@ -38,12 +41,14 @@ class WakeWordDetector:
         self._wake_kw  = WAKE_WORD.lower().strip()
         self._running  = False
         self._paused   = False
+        self._reset_pending = False
         self._thread: Optional[threading.Thread] = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
             return
         self._running = True
+        self._reset_pending = True
         self._thread  = threading.Thread(target=self._loop, daemon=True, name="WakeWord")
         self._thread.start()
         log.info("Wake-word detector started — phrase: %r", self._wake_kw)
@@ -53,9 +58,11 @@ class WakeWordDetector:
 
     def pause(self):
         self._paused = True
+        self._reset_pending = True
 
     def resume(self):
         self._paused = False
+        self._reset_pending = True
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -88,6 +95,17 @@ class WakeWordDetector:
 
         try:
             while self._running:
+                if self._reset_pending:
+                    while True:
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+                    buf.clear()
+                    buf_len = 0
+                    next_check = time.time() + STEP_SECS
+                    self._reset_pending = False
+
                 # Drain available audio into rolling buffer
                 while True:
                     try:
@@ -117,23 +135,29 @@ class WakeWordDetector:
                     continue
 
                 log.debug("Wake: checking window, rms=%.4f", rms)
-                text = self._transcribe(rec, audio)
-                if text and self._wake_kw in text.lower():
+                text = self._transcribe(rec, audio)  # pyright: ignore[reportGeneralTypeIssues]
+                if text:
+                    log.info("Wake transcript: %r", text)
+
+                if text and self._matches_wake_phrase(text):
                     log.info("Wake word detected: %r", text)
                     self._on_wake()
-                    # Clear buffer so we don't re-trigger immediately
-                    buf.clear()
-                    buf_len = 0
-                    next_check = time.time() + STEP_SECS
 
         finally:
             self._capture.unsubscribe(q)
 
     @classmethod
-    def _transcribe(cls, rec, audio_np: np.ndarray) -> str:
+    def _transcribe(cls, rec: Any, audio_np: np.ndarray) -> str:
         if cls._whisper_model is not None:
             try:
-                result = cls._whisper_model.transcribe(audio_np, language="en", fp16=False)
+                result = cls._whisper_model.transcribe(
+                    audio_np,
+                    language="en",
+                    fp16=False,
+                    temperature=0.0,
+                    condition_on_previous_text=False,
+                    initial_prompt="hey mac",
+                )
                 return result["text"]
             except Exception as e:
                 log.warning("Wake: whisper transcribe error: %s", e)
@@ -147,8 +171,46 @@ class WakeWordDetector:
             sf.write(buf, audio_int16, SAMPLE_RATE, format="WAV", subtype="PCM_16")
             buf.seek(0)
             with sr.AudioFile(buf) as source:
-                audio_data = rec.record(source)
-            return rec.recognize_google(audio_data)
+                audio_data = getattr(rec, "record")(source)
+                return getattr(rec, "recognize_google")(audio_data)
         except Exception as e:
             log.warning("Wake: Google STT error: %s", e)
             return ""
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return re.sub(r"[^a-z0-9\s]+", " ", text.lower()).strip()
+
+    def _matches_wake_phrase(self, text: str) -> bool:
+        normalized_text = self._normalize_text(text)
+        normalized_wake = self._normalize_text(self._wake_kw)
+
+        if not normalized_text or not normalized_wake:
+            return False
+
+        if normalized_wake in normalized_text:
+            return True
+
+        text_tokens = normalized_text.split()
+        wake_tokens = normalized_wake.split()
+
+        if len(wake_tokens) == 2:
+            first, second = wake_tokens
+            for i, token in enumerate(text_tokens):
+                if not self._token_close(token, first):
+                    continue
+                window = text_tokens[i + 1 : i + 4]
+                if any(
+                    token2 == second or SequenceMatcher(None, token2, second).ratio() >= 0.63
+                    for token2 in window
+                ):
+                    return True
+
+            return False
+
+        return SequenceMatcher(None, normalized_text, normalized_wake).ratio() >= 0.84
+
+    @staticmethod
+    def _token_close(a: str, b: str) -> bool:
+        return a == b or SequenceMatcher(None, a, b).ratio() >= 0.74
+

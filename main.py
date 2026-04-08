@@ -28,7 +28,7 @@ log = logging.getLogger("talkingmac")
 # Ensure project root on path (needed for PyCharm + terminal)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import AI_BACKEND, WAKE_WORD
+from config import AI_BACKEND
 from ui.app import TalkingMACApp
 from ui.expressions import Expression
 from ai.llm_manager import LLMManager
@@ -79,6 +79,8 @@ class TalkingMACAssistant:
 
         # Prevent overlapping queries
         self._busy = threading.Lock()
+        self._wake_lock = threading.Lock()
+        self._wake_pause_depth = 0
 
     # ── Boot ──────────────────────────────────────────────────────────────────
 
@@ -110,6 +112,7 @@ class TalkingMACAssistant:
 
     def _on_tts_start(self):
         """Called by TTS worker thread the moment audio starts playing."""
+        self._pause_wake_detection()
         self._ui.set_expression(Expression.TALKING)
         self._ui.set_mode_label("TALKING")
 
@@ -117,6 +120,7 @@ class TalkingMACAssistant:
         """Called by TTS worker thread when audio finishes."""
         self._ui.set_expression(Expression.IDLE)
         self._ui.set_mode_label("IDLE")
+        self._resume_wake_detection()
 
     # ── Wake word ─────────────────────────────────────────────────────────────
 
@@ -125,7 +129,12 @@ class TalkingMACAssistant:
             return  # already handling something
         try:
             self._ww.pause()
+            self._pause_wake_detection()
+            self._ui.set_look_target(0.0, -0.3)
+            self._ui.set_expression(Expression.HAPPY)
+            time.sleep(0.15)
             self._set_state(Expression.LISTENING, "LISTENING")
+            self._ui.set_look_target(0.0, 0.45)
             self._ui.show_status("Listening…", ttl=10)
 
             text = self._stt.listen()
@@ -137,6 +146,7 @@ class TalkingMACAssistant:
 
             self._process_query(text)
         finally:
+            self._resume_wake_detection()
             self._ww.resume()
             self._busy.release()
 
@@ -192,19 +202,34 @@ class TalkingMACAssistant:
 
     def _greet(self):
         time.sleep(1.0)
-        self._set_state(Expression.HAPPY, "HAPPY")
-        msg = (
-            "Hello! I'm Mac. "
-            f"Say '{WAKE_WORD}' to talk, or just type below."
-        )
-        self._tts.speak(msg)
-        # on_tts_end sets IDLE automatically
+        msg = "Hello! I'm Mac. Say the wake word to talk, or just type below."
+        self._pause_wake_detection()
+        try:
+            self._set_state(Expression.HAPPY, "HAPPY")
+            self._tts.speak(msg)
+        finally:
+            # on_tts_end sets IDLE automatically
+            self._resume_wake_detection()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _set_state(self, expr: Expression, label: str):
         self._ui.set_expression(expr)
         self._ui.set_mode_label(label)
+
+    def _pause_wake_detection(self):
+        with self._wake_lock:
+            self._wake_pause_depth += 1
+            if self._wake_pause_depth == 1:
+                self._ww.pause()
+
+    def _resume_wake_detection(self):
+        with self._wake_lock:
+            if self._wake_pause_depth == 0:
+                return
+            self._wake_pause_depth -= 1
+            if self._wake_pause_depth == 0:
+                self._ww.resume()
 
     def _init_llm(self) -> LLMManager | None:
         try:

@@ -8,7 +8,6 @@ Google Web Speech API or local Whisper.
 
 import io
 import logging
-import tempfile
 from typing import Optional
 
 import numpy as np
@@ -19,7 +18,7 @@ from voice.audio_capture import AudioCapture, SAMPLE_RATE
 
 log = logging.getLogger(__name__)
 
-SILENCE_LEVEL = 0.012   # RMS below this = silence
+SILENCE_LEVEL = 0.008   # RMS below this = silence
 SILENCE_SECS  = 1.6     # seconds of trailing silence before stopping
 MAX_SECS      = LISTEN_TIMEOUT + 2
 
@@ -59,6 +58,10 @@ class STTEngine:
         max_samples     = int(MAX_SECS * SAMPLE_RATE)
         total_samples   = 0
         speech_started  = False
+        noise_floor     = 0.0
+        noise_samples   = 0
+        speech_thresh   = SILENCE_LEVEL
+        trailing_thresh = SILENCE_LEVEL * 0.75
         deadline        = time.time() + timeout
 
         try:
@@ -72,13 +75,22 @@ class STTEngine:
                 total_samples += len(chunk)
                 rms = float(np.sqrt(np.mean(chunk ** 2)))
 
-                if rms > SILENCE_LEVEL:
+                if not speech_started:
+                    noise_samples += 1
+                    noise_floor += (rms - noise_floor) / noise_samples
+                    speech_thresh = max(SILENCE_LEVEL, noise_floor * 2.5 + 0.002)
+                    trailing_thresh = max(SILENCE_LEVEL * 0.75, noise_floor * 1.5 + 0.001)
+
+                if rms > speech_thresh:
                     speech_started = True
                     silence_samples = 0
                 elif speech_started:
-                    silence_samples += len(chunk)
-                    if silence_samples >= silence_thresh:
-                        break   # trailing silence — done
+                    if rms < trailing_thresh:
+                        silence_samples += len(chunk)
+                        if silence_samples >= silence_thresh:
+                            break   # trailing silence — done
+                    else:
+                        silence_samples = 0
 
         finally:
             self._capture.unsubscribe(q)
@@ -108,7 +120,7 @@ class STTEngine:
             with sr.AudioFile(buf) as source:
                 audio_data = rec.record(source)
 
-            text = rec.recognize_google(audio_data)
+            text = rec.recognize_google(audio_data)  # type: ignore[attr-defined]
             log.info("STT result: %r", text)
             return text
 
@@ -118,10 +130,9 @@ class STTEngine:
 
     def _transcribe_whisper(self, audio: np.ndarray) -> str:
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                sf.write(f.name, audio, SAMPLE_RATE)
-                tmp_path = f.name
-            result = self._whisper.transcribe(tmp_path, fp16=False)
+            audio_f32 = np.asarray(audio, dtype=np.float32)
+            audio_f32 = np.clip(audio_f32, -1.0, 1.0)
+            result = self._whisper.transcribe(audio_f32, fp16=False)
             text   = result.get("text", "").strip()
             log.info("Whisper result: %r", text)
             return text

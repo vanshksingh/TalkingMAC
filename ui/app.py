@@ -7,9 +7,10 @@ Keyboard input is captured silently; on Enter it fires on_text_input.
 While the user is typing, face pupils look downward (toward keyboard).
 """
 
-import math
 import threading
 import time
+from typing import Callable
+
 import pygame
 
 from config import COLOR_BG, TARGET_FPS, WINDOW_TITLE
@@ -50,8 +51,8 @@ class TalkingMACApp:
         self._typing     = False   # True while user has pending keystrokes
 
         # Callbacks
-        self.on_text_input: callable = None
-        self.on_quit:       callable = None
+        self.on_text_input: Callable[[str], None] | None = None
+        self.on_quit: Callable[[], None] | None = None
 
         # CRT scanline + vignette overlay (baked once at startup)
         self._overlay = self._make_overlay()
@@ -62,6 +63,9 @@ class TalkingMACApp:
         with self._lock:
             self._expression = expr
         self._face.expression = expr
+
+    def set_look_target(self, dx: float, dy: float):
+        self._face.set_look_target(dx, dy)
 
     # These are kept for API compatibility with main.py but do nothing visual
     def show_status(self, text: str, ttl: float = 5.0):
