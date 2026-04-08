@@ -37,6 +37,8 @@ from voice.audio_capture import AudioCapture
 from voice.tts import TTSEngine
 from voice.stt import STTEngine
 from voice.wake_word import WakeWordDetector
+
+
 class TalkingMACAssistant:
     """
     Top-level orchestrator.
@@ -79,6 +81,8 @@ class TalkingMACAssistant:
 
         # Prevent overlapping queries
         self._busy = threading.Lock()
+        self._wake_handler_lock = threading.Lock()
+        self._interrupt_requested = threading.Event()
         self._wake_lock = threading.Lock()
         self._wake_pause_depth = 0
 
@@ -112,7 +116,6 @@ class TalkingMACAssistant:
 
     def _on_tts_start(self):
         """Called by TTS worker thread the moment audio starts playing."""
-        self._pause_wake_detection()
         self._ui.set_expression(Expression.TALKING)
         self._ui.set_mode_label("TALKING")
 
@@ -120,35 +123,62 @@ class TalkingMACAssistant:
         """Called by TTS worker thread when audio finishes."""
         self._ui.set_expression(Expression.IDLE)
         self._ui.set_mode_label("IDLE")
-        self._resume_wake_detection()
 
     # ── Wake word ─────────────────────────────────────────────────────────────
 
     def _on_wake_word(self):
-        if not self._busy.acquire(blocking=False):
+        # Keep wake detection thread responsive: handle wake work asynchronously.
+        threading.Thread(target=self._handle_wake_word_event, daemon=True).start()
+
+    def _handle_wake_word_event(self):
+        wake_lock_held = self._wake_handler_lock.acquire(blocking=False)
+        if not wake_lock_held:
+            return  # drop duplicate wake events while one is being handled
+
+        busy_now = self._busy.locked()
+        barge_in = busy_now or self._tts.is_speaking
+
+        if barge_in:
+            log.info("Wake word during active response: requesting interruption")
+            self._interrupt_requested.set()
+            self._tts.stop()
+            self._busy.acquire()
+        elif not self._busy.acquire(blocking=False):
+            self._wake_handler_lock.release()
             return  # already handling something
+
         try:
-            self._ww.pause()
-            self._pause_wake_detection()
+            self._interrupt_requested.clear()
             self._ui.set_look_target(0.0, -0.3)
             self._ui.set_expression(Expression.HAPPY)
             time.sleep(0.15)
             self._set_state(Expression.LISTENING, "LISTENING")
             self._ui.set_look_target(0.0, 0.45)
-            self._ui.show_status("Listening…", ttl=10)
+            if barge_in:
+                self._ui.show_status("Interrupted. Listening…", ttl=10)
+            else:
+                self._ui.show_status("Listening…", ttl=10)
 
-            text = self._stt.listen()
+            # Pause wake detection only while capturing the user's utterance.
+            self._pause_wake_detection()
+            try:
+                text = self._stt.listen()
+            finally:
+                self._resume_wake_detection()
 
             if not text:
                 self._ui.show_status("Didn't catch that — say 'hey mac' again", ttl=4)
                 self._set_state(Expression.IDLE, "IDLE")
                 return
 
+            # Allow future wake events while we are thinking/talking so barge-in works.
+            self._wake_handler_lock.release()
+            wake_lock_held = False
             self._process_query(text)
         finally:
-            self._resume_wake_detection()
-            self._ww.resume()
             self._busy.release()
+            if wake_lock_held:
+                self._wake_handler_lock.release()
 
     # ── Text input from keyboard ───────────────────────────────────────────────
 
@@ -165,6 +195,7 @@ class TalkingMACAssistant:
 
     def _process_query(self, user_text: str):
         log.info("Query: %r", user_text)
+        self._interrupt_requested.clear()
 
         if self._llm is None:
             self._set_state(Expression.ERROR, "ERROR")
@@ -178,6 +209,10 @@ class TalkingMACAssistant:
         try:
             full_response = ""
             for chunk in self._llm.chat_stream(user_text):
+                if self._interrupt_requested.is_set():
+                    log.info("Response interrupted during thinking")
+                    self._set_state(Expression.IDLE, "IDLE")
+                    return
                 full_response += chunk
 
             if not full_response.strip():
@@ -195,6 +230,10 @@ class TalkingMACAssistant:
 
         # ── Speak (TTS callbacks drive TALKING ↔ IDLE transitions) ───────────
         # Face goes TALKING exactly when audio starts via on_tts_start callback
+        if self._interrupt_requested.is_set():
+            log.info("Response interrupted before speaking")
+            self._set_state(Expression.IDLE, "IDLE")
+            return
         self._tts.speak(full_response)
         # on_tts_end callback already set face back to IDLE
 
@@ -203,13 +242,8 @@ class TalkingMACAssistant:
     def _greet(self):
         time.sleep(1.0)
         msg = "Hello! I'm Mac. Say the wake word to talk, or just type below."
-        self._pause_wake_detection()
-        try:
-            self._set_state(Expression.HAPPY, "HAPPY")
-            self._tts.speak(msg)
-        finally:
-            # on_tts_end sets IDLE automatically
-            self._resume_wake_detection()
+        self._set_state(Expression.HAPPY, "HAPPY")
+        self._tts.speak(msg)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

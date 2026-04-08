@@ -26,8 +26,8 @@ from voice.audio_capture import AudioCapture, SAMPLE_RATE
 
 log = logging.getLogger(__name__)
 
-WINDOW_SECS   = 3.0                          # rolling window size
-STEP_SECS     = 1.0                          # how often we run STT
+WINDOW_SECS   = 2.0                          # rolling window size (lower latency)
+STEP_SECS     = 0.4                          # how often we run STT
 WINDOW_SAMPLES = int(WINDOW_SECS * SAMPLE_RATE)
 ENERGY_THRESH  = 0.0015                      # skip STT on near-silence
 
@@ -120,7 +120,7 @@ class WakeWordDetector:
                         break   # queue empty
 
                 if self._paused or time.time() < next_check:
-                    time.sleep(0.05)
+                    time.sleep(0.02)
                     continue
 
                 next_check = time.time() + STEP_SECS

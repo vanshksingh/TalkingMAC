@@ -132,6 +132,7 @@ class TTSEngine:
                 break
 
             elif cmd == "stop":
+                was_speaking = self._speaking.is_set()
                 try:
                     if engine is not None:
                         engine.stop()
@@ -140,7 +141,7 @@ class TTSEngine:
                 self._terminate_current_process()
                 self._speaking.clear()
                 self._done.set()
-                if self.on_speaking_end:
+                if was_speaking and self.on_speaking_end:
                     try:
                         self.on_speaking_end()
                     except Exception:
@@ -163,8 +164,7 @@ class TTSEngine:
                                     self.on_speaking_start()
                                 except Exception:
                                     pass
-                            engine.say(payload)
-                            engine.runAndWait()
+                            self._speak_with_pyttsx3(engine, payload)
                             spoken = True
                             break
 
@@ -209,6 +209,46 @@ class TTSEngine:
                             self.on_speaking_end()
                         except Exception:
                             pass
+
+    def _speak_with_pyttsx3(self, engine, text: str):
+        """Run pyttsx3 in small iterations so stop() can interrupt mid-utterance."""
+        engine.say(text)
+        started_loop = False
+        try:
+            try:
+                engine.startLoop(False)
+                started_loop = True
+            except Exception:
+                # Fallback path if driver loop control is unavailable.
+                engine.runAndWait()
+                return
+
+            while True:
+                if self._stop_requested.is_set():
+                    try:
+                        engine.stop()
+                    except Exception:
+                        pass
+                    break
+
+                try:
+                    engine.iterate()
+                except Exception:
+                    break
+
+                try:
+                    if not engine.isBusy():
+                        break
+                except Exception:
+                    # If driver cannot report busy state, keep iterating briefly.
+                    pass
+                time.sleep(0.01)
+        finally:
+            if started_loop:
+                try:
+                    engine.endLoop()
+                except Exception:
+                    pass
 
     @staticmethod
     def _native_command(backend: str, text: str, voice_name: str = "") -> list[str]:
