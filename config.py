@@ -30,8 +30,14 @@ STT_WHISPER_MODEL: str = os.getenv("STT_WHISPER_MODEL", "small.en")
 STT_WHISPER_LANGUAGE: str = os.getenv("STT_WHISPER_LANGUAGE", "en")
 STT_WHISPER_INITIAL_PROMPT: str = os.getenv(
     "STT_WHISPER_INITIAL_PROMPT",
-    "Short commands to TalkingMAC, including wake words, names, and brief natural speech.",
+    "Short spoken commands for TalkingMAC, including names, places, and everyday objects.",
 )
+STT_TRAILING_SILENCE_SECS: float = float(os.getenv("STT_TRAILING_SILENCE_SECS", "1.0"))
+STT_WHISPER_BEAM_SIZE: int = int(os.getenv("STT_WHISPER_BEAM_SIZE", "6"))
+STT_WHISPER_BEST_OF: int = int(os.getenv("STT_WHISPER_BEST_OF", "6"))
+STT_WHISPER_DUAL_PASS: bool = os.getenv("STT_WHISPER_DUAL_PASS", "1").lower() not in {"0", "false", "no"}
+TTS_VOICE_TYPE: str = os.getenv("TTS_VOICE_TYPE", "default")
+TTS_VOICE_NAME: str = os.getenv("TTS_VOICE_NAME", "")
 TTS_RATE: int       = int(os.getenv("TTS_RATE", "165"))
 TTS_VOLUME: float   = float(os.getenv("TTS_VOLUME", "0.9"))
 AMBIENT_DURATION: float = 1.0
