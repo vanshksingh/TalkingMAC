@@ -1,0 +1,239 @@
+"""
+TalkingMAC — Retro Macintosh AI Assistant
+==========================================
+
+Entry point.  Wires all subsystems together.
+
+Run:
+    python3 main.py
+    AI_BACKEND=gemini python3 main.py
+
+PyCharm: set main.py as run target.
+"""
+
+import logging
+import os
+import sys
+import threading
+import time
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("talkingmac")
+
+# Ensure project root on path (needed for PyCharm + terminal)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config import AI_BACKEND, WAKE_WORD
+from ui.app import TalkingMACApp
+from ui.expressions import Expression
+from ai.llm_manager import LLMManager
+from ai.mcp_client import MCPClient
+from voice.audio_capture import AudioCapture
+from voice.tts import TTSEngine
+from voice.stt import STTEngine
+from voice.wake_word import WakeWordDetector
+class TalkingMACAssistant:
+    """
+    Top-level orchestrator.
+
+    State machine:
+        IDLE
+          ↓  wake word spoken OR text typed
+        LISTENING (face listens, STT records)
+          ↓
+        THINKING (LLM generating)
+          ↓  first token received
+        [wait for LLM to finish streaming]
+          ↓  TTS starts playing
+        TALKING  ← face animates mouth while audio plays
+          ↓  TTS finishes
+        IDLE
+    """
+
+    def __init__(self):
+        log.info("Booting TalkingMAC — backend: %s", AI_BACKEND)
+
+        # Shared mic capture (started before STT / wake word)
+        self._capture = AudioCapture()
+
+        # UI first so we can show errors
+        self._ui  = TalkingMACApp()
+        self._tts = TTSEngine()
+        self._stt = STTEngine(self._capture)
+        self._ww  = WakeWordDetector(self._capture, on_wake=self._on_wake_word)
+        self._llm = self._init_llm()
+        self._mcp = MCPClient()
+
+        # Wire TTS → face animation (this is the key sync fix)
+        self._tts.on_speaking_start = self._on_tts_start
+        self._tts.on_speaking_end   = self._on_tts_end
+
+        # Wire UI callbacks
+        self._ui.on_text_input = self._handle_text_input
+        self._ui.on_quit       = self._shutdown
+
+        # Prevent overlapping queries
+        self._busy = threading.Lock()
+
+    # ── Boot ──────────────────────────────────────────────────────────────────
+
+    def run(self):
+        # Start microphone FIRST (both wake word and STT need it)
+        try:
+            self._capture.start()
+        except Exception as exc:
+            log.error("Microphone failed: %s", exc)
+            self._ui.show_status(f"Mic error: {exc} — text input still works", ttl=12)
+
+        # MCP init in background (non-blocking)
+        threading.Thread(target=self._init_mcp, daemon=True).start()
+
+        # Wake word detector
+        self._ww.start()
+
+        # Greeting in background
+        threading.Thread(target=self._greet, daemon=True).start()
+
+        self._ui.set_mode_label("IDLE")
+        log.info("TalkingMAC ready")
+
+        # Blocks until ESC / window close
+        self._ui.run()
+        self._shutdown()
+
+    # ── TTS sync callbacks ────────────────────────────────────────────────────
+
+    def _on_tts_start(self):
+        """Called by TTS worker thread the moment audio starts playing."""
+        self._ui.set_expression(Expression.TALKING)
+        self._ui.set_mode_label("TALKING")
+
+    def _on_tts_end(self):
+        """Called by TTS worker thread when audio finishes."""
+        self._ui.set_expression(Expression.IDLE)
+        self._ui.set_mode_label("IDLE")
+
+    # ── Wake word ─────────────────────────────────────────────────────────────
+
+    def _on_wake_word(self):
+        if not self._busy.acquire(blocking=False):
+            return  # already handling something
+        try:
+            self._ww.pause()
+            self._set_state(Expression.LISTENING, "LISTENING")
+            self._ui.show_status("Listening…", ttl=10)
+
+            text = self._stt.listen()
+
+            if not text:
+                self._ui.show_status("Didn't catch that — say 'hey mac' again", ttl=4)
+                self._set_state(Expression.IDLE, "IDLE")
+                return
+
+            self._process_query(text)
+        finally:
+            self._ww.resume()
+            self._busy.release()
+
+    # ── Text input from keyboard ───────────────────────────────────────────────
+
+    def _handle_text_input(self, text: str):
+        if not self._busy.acquire(blocking=False):
+            self._ui.show_status("Still thinking… wait a moment", ttl=3)
+            return
+        try:
+            self._process_query(text)
+        finally:
+            self._busy.release()
+
+    # ── Core pipeline ─────────────────────────────────────────────────────────
+
+    def _process_query(self, user_text: str):
+        log.info("Query: %r", user_text)
+
+        if self._llm is None:
+            self._set_state(Expression.ERROR, "ERROR")
+            self._ui.show_status("No LLM — check config / Ollama", ttl=8)
+            return
+
+        # ── Think (LLM generates full response) ──────────────────────────────
+        self._set_state(Expression.THINKING, "THINKING")
+        self._ui.show_status("", ttl=0)
+
+        try:
+            full_response = ""
+            for chunk in self._llm.chat_stream(user_text):
+                full_response += chunk
+
+            if not full_response.strip():
+                raise ValueError("Empty LLM response")
+
+            log.info("Response ready (%d chars)", len(full_response))
+
+        except Exception as exc:
+            log.error("LLM error: %s", exc)
+            self._set_state(Expression.ERROR, "ERROR")
+            self._ui.show_status(f"Error: {exc}", ttl=8)
+            time.sleep(2)
+            self._set_state(Expression.IDLE, "IDLE")
+            return
+
+        # ── Speak (TTS callbacks drive TALKING ↔ IDLE transitions) ───────────
+        # Face goes TALKING exactly when audio starts via on_tts_start callback
+        self._tts.speak(full_response)
+        # on_tts_end callback already set face back to IDLE
+
+    # ── Greeting ──────────────────────────────────────────────────────────────
+
+    def _greet(self):
+        time.sleep(1.0)
+        self._set_state(Expression.HAPPY, "HAPPY")
+        msg = (
+            "Hello! I'm Mac. "
+            f"Say '{WAKE_WORD}' to talk, or just type below."
+        )
+        self._tts.speak(msg)
+        # on_tts_end sets IDLE automatically
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _set_state(self, expr: Expression, label: str):
+        self._ui.set_expression(expr)
+        self._ui.set_mode_label(label)
+
+    def _init_llm(self) -> LLMManager | None:
+        try:
+            return LLMManager()
+        except Exception as exc:
+            log.error("LLM init failed: %s", exc)
+            self._ui.show_status(f"LLM Error: {exc}", ttl=15)
+            return None
+
+    def _init_mcp(self):
+        import asyncio
+        asyncio.run(self._mcp.start())
+        if self._mcp.enabled:
+            log.info("MCP tools: %s", self._mcp.tool_names())
+
+    def _shutdown(self):
+        log.info("Shutting down…")
+        self._ww.stop()
+        self._capture.stop()
+        self._tts.shutdown()
+        if self._ui.is_running():
+            self._ui.stop()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    TalkingMACAssistant().run()
+
+
+if __name__ == "__main__":
+    main()

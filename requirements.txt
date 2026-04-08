@@ -1,0 +1,28 @@
+# TalkingMAC requirements
+# Install: pip install -r requirements.txt
+
+# UI
+pygame>=2.6
+
+# AI backends
+ollama>=0.6
+google-generativeai>=0.8
+google-genai>=1.0
+langchain>=0.3
+langchain-community>=0.3
+langchain-google-genai>=2.0
+langchain-mcp>=0.2
+langchain-core>=0.3,<1.0
+
+# Voice
+SpeechRecognition>=3.10
+pyttsx3>=2.90
+sounddevice>=0.4
+soundfile>=0.12
+numpy>=1.24
+
+# Optional: local Whisper STT (large download)
+openai-whisper
+
+# Utilities
+python-dotenv>=1.0
