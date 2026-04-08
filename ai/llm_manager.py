@@ -213,3 +213,4 @@ class LLMManager:
             for chunk in self._lc_gemini.stream(lc_msgs):
                 if chunk.content:
                     yield chunk.content
+

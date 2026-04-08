@@ -13,7 +13,13 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 
-from config import STT_ENGINE, LISTEN_TIMEOUT
+from config import (
+    LISTEN_TIMEOUT,
+    STT_ENGINE,
+    STT_WHISPER_INITIAL_PROMPT,
+    STT_WHISPER_LANGUAGE,
+    STT_WHISPER_MODEL,
+)
 from voice.audio_capture import AudioCapture, SAMPLE_RATE
 
 log = logging.getLogger(__name__)
@@ -28,6 +34,9 @@ class STTEngine:
         self._capture = capture
         self._engine  = STT_ENGINE.lower()
         self._whisper = None
+        self._whisper_model_name = STT_WHISPER_MODEL
+        self._whisper_language = STT_WHISPER_LANGUAGE.strip() or None
+        self._whisper_prompt = STT_WHISPER_INITIAL_PROMPT.strip()
         if self._engine == "whisper":
             self._load_whisper()
         log.info("STT engine: %s", self._engine)
@@ -132,7 +141,21 @@ class STTEngine:
         try:
             audio_f32 = np.asarray(audio, dtype=np.float32)
             audio_f32 = np.clip(audio_f32, -1.0, 1.0)
-            result = self._whisper.transcribe(audio_f32, fp16=False)
+            result = self._whisper.transcribe(
+                audio_f32,
+                fp16=False,
+                task="transcribe",
+                language=self._whisper_language,
+                temperature=0.0,
+                condition_on_previous_text=False,
+                initial_prompt=self._whisper_prompt,
+                beam_size=5,
+                best_of=5,
+                no_speech_threshold=0.35,
+                logprob_threshold=-1.0,
+                compression_ratio_threshold=2.4,
+                verbose=False,
+            )
             text   = result.get("text", "").strip()
             log.info("Whisper result: %r", text)
             return text
@@ -143,13 +166,13 @@ class STTEngine:
     def _load_whisper(self):
         try:
             import ssl, whisper
-            log.info("Loading Whisper 'base' model…")
+            log.info("Loading Whisper %r model…", self._whisper_model_name)
             # macOS Python often has SSL cert issues when downloading model weights;
             # disable verification only for this one-time download — cached after that.
             _orig = ssl._create_default_https_context
             ssl._create_default_https_context = ssl._create_unverified_context
             try:
-                self._whisper = whisper.load_model("base")
+                self._whisper = whisper.load_model(self._whisper_model_name)
             finally:
                 ssl._create_default_https_context = _orig
         except Exception as exc:

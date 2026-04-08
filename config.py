@@ -26,6 +26,12 @@ SYSTEM_PROMPT: str = (
 # ── Voice ────────────────────────────────────────────────────────────────────
 WAKE_WORD: str      = os.getenv("WAKE_WORD", "hey mac")
 STT_ENGINE: str     = os.getenv("STT_ENGINE", "whisper")
+STT_WHISPER_MODEL: str = os.getenv("STT_WHISPER_MODEL", "small.en")
+STT_WHISPER_LANGUAGE: str = os.getenv("STT_WHISPER_LANGUAGE", "en")
+STT_WHISPER_INITIAL_PROMPT: str = os.getenv(
+    "STT_WHISPER_INITIAL_PROMPT",
+    "Short commands to TalkingMAC, including wake words, names, and brief natural speech.",
+)
 TTS_RATE: int       = int(os.getenv("TTS_RATE", "165"))
 TTS_VOLUME: float   = float(os.getenv("TTS_VOLUME", "0.9"))
 AMBIENT_DURATION: float = 1.0
