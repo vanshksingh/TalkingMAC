@@ -56,6 +56,23 @@ STT_WHISPER_BEAM_SIZE: int = int(os.getenv("STT_WHISPER_BEAM_SIZE", "6"))
 STT_WHISPER_BEST_OF: int = int(os.getenv("STT_WHISPER_BEST_OF", "6"))
 STT_WHISPER_DUAL_PASS: bool = _env_bool("STT_WHISPER_DUAL_PASS", "1")
 
+# Wake-word sensitivity tuning (affects barge-in behavior too):
+# Higher WAKE_ENERGY_THRESH and higher WAKE_MIN_TRIGGER_INTERVAL_SECS => fewer false triggers.
+# Higher *_TOKEN_MIN values => stricter phrase matching.
+WAKE_CHECK_STEP_SECS: float = max(0.1, float(os.getenv("WAKE_CHECK_STEP_SECS", "0.4")))
+WAKE_ENERGY_THRESH: float = max(0.0, float(os.getenv("WAKE_ENERGY_THRESH", "0.0015")))
+WAKE_MIN_TRIGGER_INTERVAL_SECS: float = max(0.0, float(os.getenv("WAKE_MIN_TRIGGER_INTERVAL_SECS", "1.2")))
+
+WAKE_IDLE_FIRST_TOKEN_MIN: float = min(0.99, max(0.5, float(os.getenv("WAKE_IDLE_FIRST_TOKEN_MIN", "0.74"))))
+WAKE_IDLE_SECOND_TOKEN_MIN: float = min(0.99, max(0.5, float(os.getenv("WAKE_IDLE_SECOND_TOKEN_MIN", "0.63"))))
+WAKE_TTS_FIRST_TOKEN_MIN: float = min(0.99, max(0.5, float(os.getenv("WAKE_TTS_FIRST_TOKEN_MIN", "0.86"))))
+WAKE_TTS_SECOND_TOKEN_MIN: float = min(0.99, max(0.5, float(os.getenv("WAKE_TTS_SECOND_TOKEN_MIN", "0.82"))))
+
+WAKE_IDLE_MAX_GAP_TOKENS: int = max(1, int(os.getenv("WAKE_IDLE_MAX_GAP_TOKENS", "3")))
+WAKE_TTS_MAX_GAP_TOKENS: int = max(1, int(os.getenv("WAKE_TTS_MAX_GAP_TOKENS", "1")))
+# While TTS is speaking, wake phrase must start within this many leading tokens.
+WAKE_TTS_PREFIX_TOKEN_LIMIT: int = max(0, int(os.getenv("WAKE_TTS_PREFIX_TOKEN_LIMIT", "1")))
+
 # Voice output style presets available in TTSEngine:
 # "default" | "female" | "male" | "classic" | "robot" | "whisper"
 TTS_VOICE_TYPE: str = os.getenv("TTS_VOICE_TYPE", "default")

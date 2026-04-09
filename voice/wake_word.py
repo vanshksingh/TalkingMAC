@@ -21,16 +21,25 @@ from typing import Any, Callable, Optional
 import numpy as np
 import soundfile as sf
 
-from config import WAKE_WORD
+from config import (
+    WAKE_WORD,
+    WAKE_CHECK_STEP_SECS,
+    WAKE_ENERGY_THRESH,
+    WAKE_MIN_TRIGGER_INTERVAL_SECS,
+    WAKE_IDLE_FIRST_TOKEN_MIN,
+    WAKE_IDLE_SECOND_TOKEN_MIN,
+    WAKE_TTS_FIRST_TOKEN_MIN,
+    WAKE_TTS_SECOND_TOKEN_MIN,
+    WAKE_IDLE_MAX_GAP_TOKENS,
+    WAKE_TTS_MAX_GAP_TOKENS,
+    WAKE_TTS_PREFIX_TOKEN_LIMIT,
+)
 from voice.audio_capture import AudioCapture, SAMPLE_RATE
 
 log = logging.getLogger(__name__)
 
 WINDOW_SECS   = 2.0                          # rolling window size (lower latency)
-STEP_SECS     = 0.4                          # how often we run STT
 WINDOW_SAMPLES = int(WINDOW_SECS * SAMPLE_RATE)
-ENERGY_THRESH  = 0.0015                      # skip STT on near-silence
-WAKE_MIN_TRIGGER_INTERVAL_SECS = 1.2         # debounce duplicate/echo triggers
 
 
 class WakeWordDetector:
@@ -55,6 +64,12 @@ class WakeWordDetector:
         self._thread  = threading.Thread(target=self._loop, daemon=True, name="WakeWord")
         self._thread.start()
         log.info("Wake-word detector started — phrase: %r", self._wake_kw)
+        log.info(
+            "Wake tuning: step=%.2fs energy=%.4f debounce=%.2fs",
+            WAKE_CHECK_STEP_SECS,
+            WAKE_ENERGY_THRESH,
+            WAKE_MIN_TRIGGER_INTERVAL_SECS,
+        )
 
     def stop(self):
         self._running = False
@@ -98,7 +113,7 @@ class WakeWordDetector:
         buf: collections.deque = collections.deque()
         buf_len = 0   # total samples currently in buf
 
-        next_check = time.time() + STEP_SECS
+        next_check = time.time() + WAKE_CHECK_STEP_SECS
 
         try:
             while self._running:
@@ -110,7 +125,7 @@ class WakeWordDetector:
                             break
                     buf.clear()
                     buf_len = 0
-                    next_check = time.time() + STEP_SECS
+                    next_check = time.time() + WAKE_CHECK_STEP_SECS
                     self._reset_pending = False
 
                 # Drain available audio into rolling buffer
@@ -130,7 +145,7 @@ class WakeWordDetector:
                     time.sleep(0.02)
                     continue
 
-                next_check = time.time() + STEP_SECS
+                next_check = time.time() + WAKE_CHECK_STEP_SECS
 
                 if buf_len < SAMPLE_RATE * 0.5:
                     continue   # not enough audio yet
@@ -138,7 +153,7 @@ class WakeWordDetector:
                 # Check energy before paying for an STT round-trip
                 audio = np.concatenate(list(buf))[-WINDOW_SAMPLES:]
                 rms = float(np.sqrt(np.mean(audio ** 2)))
-                if rms < ENERGY_THRESH:
+                if rms < WAKE_ENERGY_THRESH:
                     continue
 
                 log.debug("Wake: checking window, rms=%.4f", rms)
@@ -208,13 +223,13 @@ class WakeWordDetector:
 
         if len(wake_tokens) == 2:
             first, second = wake_tokens
-            first_min = 0.86 if self._tts_active else 0.74
-            second_min = 0.82 if self._tts_active else 0.63
-            max_gap = 1 if self._tts_active else 3
+            first_min = WAKE_TTS_FIRST_TOKEN_MIN if self._tts_active else WAKE_IDLE_FIRST_TOKEN_MIN
+            second_min = WAKE_TTS_SECOND_TOKEN_MIN if self._tts_active else WAKE_IDLE_SECOND_TOKEN_MIN
+            max_gap = WAKE_TTS_MAX_GAP_TOKENS if self._tts_active else WAKE_IDLE_MAX_GAP_TOKENS
             for i, token in enumerate(text_tokens):
                 if not self._token_close(token, first, min_ratio=first_min):
                     continue
-                if self._tts_active and i > 1:
+                if self._tts_active and i > WAKE_TTS_PREFIX_TOKEN_LIMIT:
                     continue
                 window = text_tokens[i + 1 : i + 1 + max_gap]
                 if any(
