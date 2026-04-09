@@ -74,8 +74,8 @@ EYE_GRIDS: dict[Expression, list[list[int]]] = {
 
     # Eyes shifted right (looking up-right), nose stays
     Expression.THINKING: [
-        [0, 0, 1, 0, 0, 0, 0, 0, 0, 1],
-        [0, 0, 1, 0, 0, 0, 0, 0, 0, 1],
+        [0, 1, 0, 0, 0, 0, 0, 0, 1, 0],
+        [0, 1, 0, 0, 0, 0, 0, 0, 1, 0],
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         [0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
         [0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
