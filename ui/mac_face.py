@@ -277,3 +277,4 @@ class PixelFace:
     @staticmethod
     def _rand_blink() -> float:
         return random.uniform(BLINK_INTERVAL_MIN, BLINK_INTERVAL_MAX)
+

@@ -25,11 +25,25 @@ SYSTEM_PROMPT: str = (
 
 # ── Voice ────────────────────────────────────────────────────────────────────
 WAKE_WORD: str      = os.getenv("WAKE_WORD", "hey mac")
+WAKE_WORD_INTERRUPTION_ENABLED: bool = os.getenv("WAKE_WORD_INTERRUPTION_ENABLED", "1").lower() not in {"0", "false", "no"}
 STT_ENGINE: str     = os.getenv("STT_ENGINE", "whisper")
+STT_WHISPER_MODEL: str = os.getenv("STT_WHISPER_MODEL", "small.en")
+STT_WHISPER_LANGUAGE: str = os.getenv("STT_WHISPER_LANGUAGE", "en")
+STT_WHISPER_INITIAL_PROMPT: str = os.getenv(
+    "STT_WHISPER_INITIAL_PROMPT",
+    "Short spoken commands for TalkingMAC, including names, places, and everyday objects.",
+)
+STT_TRAILING_SILENCE_SECS: float = float(os.getenv("STT_TRAILING_SILENCE_SECS", "1.0"))
+STT_WHISPER_BEAM_SIZE: int = int(os.getenv("STT_WHISPER_BEAM_SIZE", "6"))
+STT_WHISPER_BEST_OF: int = int(os.getenv("STT_WHISPER_BEST_OF", "6"))
+STT_WHISPER_DUAL_PASS: bool = os.getenv("STT_WHISPER_DUAL_PASS", "1").lower() not in {"0", "false", "no"}
+TTS_VOICE_TYPE: str = os.getenv("TTS_VOICE_TYPE", "default")
+TTS_VOICE_NAME: str = os.getenv("TTS_VOICE_NAME", "")
 TTS_RATE: int       = int(os.getenv("TTS_RATE", "165"))
 TTS_VOLUME: float   = float(os.getenv("TTS_VOLUME", "0.9"))
 AMBIENT_DURATION: float = 1.0
 LISTEN_TIMEOUT: int = 8
+IDLE_SLEEP_TIMEOUT_SECS: float = float(os.getenv("IDLE_SLEEP_TIMEOUT_SECS", "60"))
 
 # ── UI ───────────────────────────────────────────────────────────────────────
 WINDOW_TITLE: str = "TalkingMAC"

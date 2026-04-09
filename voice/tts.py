@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-from config import TTS_RATE, TTS_VOLUME
+from config import TTS_RATE, TTS_VOLUME, TTS_VOICE_NAME, TTS_VOICE_TYPE
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +29,8 @@ class TTSEngine:
         self._stop_requested = threading.Event()
         self._proc_lock = threading.Lock()
         self._current_proc: subprocess.Popen | None = None
+        self._voice_type = TTS_VOICE_TYPE.strip().lower() or "default"
+        self._voice_name = TTS_VOICE_NAME.strip()
         self._backends = self._select_backends()
         self._thread   = threading.Thread(target=self._worker, daemon=True, name="TTS")
         self._thread.start()
@@ -114,6 +116,7 @@ class TTSEngine:
                 engine = pyttsx3.init()
                 engine.setProperty("rate", TTS_RATE)
                 engine.setProperty("volume", TTS_VOLUME)
+                self._configure_pyttsx3_voice(engine)
                 log.info("TTS ready (pyttsx3, rate=%d)", TTS_RATE)
             except Exception as exc:
                 log.warning("TTS pyttsx3 unavailable: %s", exc)
@@ -129,6 +132,7 @@ class TTSEngine:
                 break
 
             elif cmd == "stop":
+                was_speaking = self._speaking.is_set()
                 try:
                     if engine is not None:
                         engine.stop()
@@ -137,7 +141,7 @@ class TTSEngine:
                 self._terminate_current_process()
                 self._speaking.clear()
                 self._done.set()
-                if self.on_speaking_end:
+                if was_speaking and self.on_speaking_end:
                     try:
                         self.on_speaking_end()
                     except Exception:
@@ -160,13 +164,12 @@ class TTSEngine:
                                     self.on_speaking_start()
                                 except Exception:
                                     pass
-                            engine.say(payload)
-                            engine.runAndWait()
+                            self._speak_with_pyttsx3(engine, payload)
                             spoken = True
                             break
 
                         try:
-                            command = self._native_command(backend, payload)
+                            command = self._native_command(backend, payload, self._native_voice_for_backend(backend))
                         except ValueError:
                             continue
 
@@ -207,13 +210,130 @@ class TTSEngine:
                         except Exception:
                             pass
 
+    def _speak_with_pyttsx3(self, engine, text: str):
+        """Run pyttsx3 in small iterations so stop() can interrupt mid-utterance."""
+        engine.say(text)
+        started_loop = False
+        try:
+            try:
+                engine.startLoop(False)
+                started_loop = True
+            except Exception:
+                # Fallback path if driver loop control is unavailable.
+                engine.runAndWait()
+                return
+
+            while True:
+                if self._stop_requested.is_set():
+                    try:
+                        engine.stop()
+                    except Exception:
+                        pass
+                    break
+
+                try:
+                    engine.iterate()
+                except Exception:
+                    break
+
+                try:
+                    if not engine.isBusy():
+                        break
+                except Exception:
+                    # If driver cannot report busy state, keep iterating briefly.
+                    pass
+                time.sleep(0.01)
+        finally:
+            if started_loop:
+                try:
+                    engine.endLoop()
+                except Exception:
+                    pass
+
     @staticmethod
-    def _native_command(backend: str, text: str) -> list[str]:
+    def _native_command(backend: str, text: str, voice_name: str = "") -> list[str]:
         if backend == "say":
-            return ["say", "-r", str(TTS_RATE), text]
+            cmd = ["say", "-r", str(TTS_RATE)]
+            if voice_name:
+                cmd.extend(["-v", voice_name])
+            return cmd + [text]
         if backend == "spd-say":
-            return ["spd-say", "-r", str(TTS_RATE), text]
+            cmd = ["spd-say", "-r", str(TTS_RATE)]
+            if voice_name:
+                cmd.extend(["-l", voice_name])
+            return cmd + [text]
         if backend in {"espeak", "espeak-ng"}:
-            return [backend, "-s", str(TTS_RATE), text]
+            cmd = [backend, "-s", str(TTS_RATE)]
+            if voice_name:
+                cmd.extend(["-v", voice_name])
+            return cmd + [text]
         raise ValueError(f"Unsupported native backend: {backend}")
+
+    def _native_voice_for_backend(self, backend: str) -> str:
+        if self._voice_name:
+            return self._voice_name
+
+        if backend == "say":
+            mac_map = {
+                "default": "",
+                "female": "Samantha",
+                "male": "Alex",
+                "classic": "Fred",
+                "robot": "Zarvox",
+                "whisper": "Whisper",
+            }
+            return mac_map.get(self._voice_type, "")
+
+        if backend in {"espeak", "espeak-ng"}:
+            linux_map = {
+                "default": "",
+                "female": "en+f3",
+                "male": "en+m3",
+                "classic": "en",
+                "robot": "en+m1",
+                "whisper": "en+f2",
+            }
+            return linux_map.get(self._voice_type, "")
+
+        if backend == "spd-say":
+            spd_map = {
+                "default": "",
+                "female": "en",
+                "male": "en",
+                "classic": "en",
+                "robot": "en",
+                "whisper": "en",
+            }
+            return spd_map.get(self._voice_type, "")
+
+        return ""
+
+    def _configure_pyttsx3_voice(self, engine):
+        target = self._voice_name.strip().lower()
+        if not target:
+            target = {
+                "default": "",
+                "female": "samantha",
+                "male": "alex",
+                "classic": "fred",
+                "robot": "zira",
+                "whisper": "victoria",
+            }.get(self._voice_type, "")
+        if not target:
+            return
+
+        try:
+            voices = engine.getProperty("voices") or []
+        except Exception:
+            return
+
+        for voice in voices:
+            blob = f"{getattr(voice, 'id', '')} {getattr(voice, 'name', '')}".lower()
+            if target in blob:
+                try:
+                    engine.setProperty("voice", voice.id)
+                    log.info("TTS voice selected: %s", getattr(voice, "name", voice.id))
+                except Exception:
+                    pass
+                return
 

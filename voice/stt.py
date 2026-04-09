@@ -13,13 +13,23 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 
-from config import STT_ENGINE, LISTEN_TIMEOUT
+from config import (
+    LISTEN_TIMEOUT,
+    STT_ENGINE,
+    STT_TRAILING_SILENCE_SECS,
+    STT_WHISPER_BEAM_SIZE,
+    STT_WHISPER_BEST_OF,
+    STT_WHISPER_DUAL_PASS,
+    STT_WHISPER_INITIAL_PROMPT,
+    STT_WHISPER_LANGUAGE,
+    STT_WHISPER_MODEL,
+)
 from voice.audio_capture import AudioCapture, SAMPLE_RATE
 
 log = logging.getLogger(__name__)
 
 SILENCE_LEVEL = 0.008   # RMS below this = silence
-SILENCE_SECS  = 1.6     # seconds of trailing silence before stopping
+SILENCE_SECS  = STT_TRAILING_SILENCE_SECS
 MAX_SECS      = LISTEN_TIMEOUT + 2
 
 
@@ -28,6 +38,12 @@ class STTEngine:
         self._capture = capture
         self._engine  = STT_ENGINE.lower()
         self._whisper = None
+        self._whisper_model_name = STT_WHISPER_MODEL
+        self._whisper_language = STT_WHISPER_LANGUAGE.strip() or None
+        self._whisper_prompt = STT_WHISPER_INITIAL_PROMPT.strip()
+        self._whisper_beam_size = max(1, STT_WHISPER_BEAM_SIZE)
+        self._whisper_best_of = max(1, STT_WHISPER_BEST_OF)
+        self._whisper_dual_pass = STT_WHISPER_DUAL_PASS
         if self._engine == "whisper":
             self._load_whisper()
         log.info("STT engine: %s", self._engine)
@@ -132,24 +148,53 @@ class STTEngine:
         try:
             audio_f32 = np.asarray(audio, dtype=np.float32)
             audio_f32 = np.clip(audio_f32, -1.0, 1.0)
-            result = self._whisper.transcribe(audio_f32, fp16=False)
-            text   = result.get("text", "").strip()
+            text, score = self._decode_whisper(audio_f32, self._whisper_prompt)
+
+            if self._whisper_dual_pass:
+                alt_text, alt_score = self._decode_whisper(audio_f32, "")
+                # Prefer the pass with stronger confidence unless it is empty.
+                if alt_text and (not text or alt_score > score + 0.05):
+                    text, score = alt_text, alt_score
+
             log.info("Whisper result: %r", text)
             return text
         except Exception as exc:
             log.warning("Whisper STT error: %s", exc)
             return ""
 
+    def _decode_whisper(self, audio_f32: np.ndarray, prompt: str) -> tuple[str, float]:
+        result = self._whisper.transcribe(
+            audio_f32,
+            fp16=False,
+            task="transcribe",
+            language=self._whisper_language,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            initial_prompt=prompt,
+            beam_size=self._whisper_beam_size,
+            best_of=self._whisper_best_of,
+            no_speech_threshold=0.35,
+            logprob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
+            verbose=False,
+        )
+        text = result.get("text", "").strip()
+        segments = result.get("segments") or []
+        if not segments:
+            return text, -5.0
+        scores = [float(seg.get("avg_logprob", -5.0)) for seg in segments]
+        return text, float(np.mean(scores))
+
     def _load_whisper(self):
         try:
             import ssl, whisper
-            log.info("Loading Whisper 'base' model…")
+            log.info("Loading Whisper %r model…", self._whisper_model_name)
             # macOS Python often has SSL cert issues when downloading model weights;
             # disable verification only for this one-time download — cached after that.
             _orig = ssl._create_default_https_context
             ssl._create_default_https_context = ssl._create_unverified_context
             try:
-                self._whisper = whisper.load_model("base")
+                self._whisper = whisper.load_model(self._whisper_model_name)
             finally:
                 ssl._create_default_https_context = _orig
         except Exception as exc:
