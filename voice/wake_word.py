@@ -30,6 +30,7 @@ WINDOW_SECS   = 2.0                          # rolling window size (lower latenc
 STEP_SECS     = 0.4                          # how often we run STT
 WINDOW_SAMPLES = int(WINDOW_SECS * SAMPLE_RATE)
 ENERGY_THRESH  = 0.0015                      # skip STT on near-silence
+WAKE_MIN_TRIGGER_INTERVAL_SECS = 1.2         # debounce duplicate/echo triggers
 
 
 class WakeWordDetector:
@@ -43,6 +44,8 @@ class WakeWordDetector:
         self._paused   = False
         self._reset_pending = False
         self._thread: Optional[threading.Thread] = None
+        self._last_wake_ts = 0.0
+        self._tts_active = False
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -63,6 +66,10 @@ class WakeWordDetector:
     def resume(self):
         self._paused = False
         self._reset_pending = True
+
+    def set_tts_active(self, active: bool):
+        """Called by orchestrator to tighten matching while assistant audio is playing."""
+        self._tts_active = bool(active)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -140,6 +147,10 @@ class WakeWordDetector:
                     log.info("Wake transcript: %r", text)
 
                 if text and self._matches_wake_phrase(text):
+                    now = time.time()
+                    if now - self._last_wake_ts < WAKE_MIN_TRIGGER_INTERVAL_SECS:
+                        continue
+                    self._last_wake_ts = now
                     log.info("Wake word detected: %r", text)
                     self._on_wake()
 
@@ -188,20 +199,26 @@ class WakeWordDetector:
         if not normalized_text or not normalized_wake:
             return False
 
-        if normalized_wake in normalized_text:
-            return True
-
         text_tokens = normalized_text.split()
         wake_tokens = normalized_wake.split()
 
+        if normalized_wake in normalized_text:
+            # During TTS, require phrase near beginning or as a short utterance to reduce speaker echo triggers.
+            return self._wake_phrase_position_ok(text_tokens, wake_tokens, strict=self._tts_active)
+
         if len(wake_tokens) == 2:
             first, second = wake_tokens
+            first_min = 0.86 if self._tts_active else 0.74
+            second_min = 0.82 if self._tts_active else 0.63
+            max_gap = 1 if self._tts_active else 3
             for i, token in enumerate(text_tokens):
-                if not self._token_close(token, first):
+                if not self._token_close(token, first, min_ratio=first_min):
                     continue
-                window = text_tokens[i + 1 : i + 4]
+                if self._tts_active and i > 1:
+                    continue
+                window = text_tokens[i + 1 : i + 1 + max_gap]
                 if any(
-                    token2 == second or SequenceMatcher(None, token2, second).ratio() >= 0.63
+                    token2 == second or SequenceMatcher(None, token2, second).ratio() >= second_min
                     for token2 in window
                 ):
                     return True
@@ -211,6 +228,20 @@ class WakeWordDetector:
         return SequenceMatcher(None, normalized_text, normalized_wake).ratio() >= 0.84
 
     @staticmethod
-    def _token_close(a: str, b: str) -> bool:
-        return a == b or SequenceMatcher(None, a, b).ratio() >= 0.74
+    def _token_close(a: str, b: str, min_ratio: float) -> bool:
+        return a == b or SequenceMatcher(None, a, b).ratio() >= min_ratio
+
+    @staticmethod
+    def _wake_phrase_position_ok(text_tokens: list[str], wake_tokens: list[str], strict: bool) -> bool:
+        if not text_tokens or not wake_tokens:
+            return False
+        n = len(wake_tokens)
+        for i in range(0, max(0, len(text_tokens) - n + 1)):
+            if text_tokens[i:i + n] != wake_tokens:
+                continue
+            if not strict:
+                return True
+            # Strict mode (TTS active): only accept short utterances or phrase near the beginning.
+            return len(text_tokens) <= n + 2 or i <= 1
+        return False
 
