@@ -21,15 +21,25 @@ from typing import Any, Callable, Optional
 import numpy as np
 import soundfile as sf
 
-from config import WAKE_WORD
+from config import (
+    WAKE_WORD,
+    WAKE_CHECK_STEP_SECS,
+    WAKE_ENERGY_THRESH,
+    WAKE_MIN_TRIGGER_INTERVAL_SECS,
+    WAKE_IDLE_FIRST_TOKEN_MIN,
+    WAKE_IDLE_SECOND_TOKEN_MIN,
+    WAKE_TTS_FIRST_TOKEN_MIN,
+    WAKE_TTS_SECOND_TOKEN_MIN,
+    WAKE_IDLE_MAX_GAP_TOKENS,
+    WAKE_TTS_MAX_GAP_TOKENS,
+    WAKE_TTS_PREFIX_TOKEN_LIMIT,
+)
 from voice.audio_capture import AudioCapture, SAMPLE_RATE
 
 log = logging.getLogger(__name__)
 
 WINDOW_SECS   = 2.0                          # rolling window size (lower latency)
-STEP_SECS     = 0.4                          # how often we run STT
 WINDOW_SAMPLES = int(WINDOW_SECS * SAMPLE_RATE)
-ENERGY_THRESH  = 0.0015                      # skip STT on near-silence
 
 
 class WakeWordDetector:
@@ -43,6 +53,8 @@ class WakeWordDetector:
         self._paused   = False
         self._reset_pending = False
         self._thread: Optional[threading.Thread] = None
+        self._last_wake_ts = 0.0
+        self._tts_active = False
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -52,6 +64,12 @@ class WakeWordDetector:
         self._thread  = threading.Thread(target=self._loop, daemon=True, name="WakeWord")
         self._thread.start()
         log.info("Wake-word detector started — phrase: %r", self._wake_kw)
+        log.info(
+            "Wake tuning: step=%.2fs energy=%.4f debounce=%.2fs",
+            WAKE_CHECK_STEP_SECS,
+            WAKE_ENERGY_THRESH,
+            WAKE_MIN_TRIGGER_INTERVAL_SECS,
+        )
 
     def stop(self):
         self._running = False
@@ -63,6 +81,10 @@ class WakeWordDetector:
     def resume(self):
         self._paused = False
         self._reset_pending = True
+
+    def set_tts_active(self, active: bool):
+        """Called by orchestrator to tighten matching while assistant audio is playing."""
+        self._tts_active = bool(active)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -91,7 +113,7 @@ class WakeWordDetector:
         buf: collections.deque = collections.deque()
         buf_len = 0   # total samples currently in buf
 
-        next_check = time.time() + STEP_SECS
+        next_check = time.time() + WAKE_CHECK_STEP_SECS
 
         try:
             while self._running:
@@ -103,7 +125,7 @@ class WakeWordDetector:
                             break
                     buf.clear()
                     buf_len = 0
-                    next_check = time.time() + STEP_SECS
+                    next_check = time.time() + WAKE_CHECK_STEP_SECS
                     self._reset_pending = False
 
                 # Drain available audio into rolling buffer
@@ -123,7 +145,7 @@ class WakeWordDetector:
                     time.sleep(0.02)
                     continue
 
-                next_check = time.time() + STEP_SECS
+                next_check = time.time() + WAKE_CHECK_STEP_SECS
 
                 if buf_len < SAMPLE_RATE * 0.5:
                     continue   # not enough audio yet
@@ -131,7 +153,7 @@ class WakeWordDetector:
                 # Check energy before paying for an STT round-trip
                 audio = np.concatenate(list(buf))[-WINDOW_SAMPLES:]
                 rms = float(np.sqrt(np.mean(audio ** 2)))
-                if rms < ENERGY_THRESH:
+                if rms < WAKE_ENERGY_THRESH:
                     continue
 
                 log.debug("Wake: checking window, rms=%.4f", rms)
@@ -140,6 +162,10 @@ class WakeWordDetector:
                     log.info("Wake transcript: %r", text)
 
                 if text and self._matches_wake_phrase(text):
+                    now = time.time()
+                    if now - self._last_wake_ts < WAKE_MIN_TRIGGER_INTERVAL_SECS:
+                        continue
+                    self._last_wake_ts = now
                     log.info("Wake word detected: %r", text)
                     self._on_wake()
 
@@ -188,20 +214,26 @@ class WakeWordDetector:
         if not normalized_text or not normalized_wake:
             return False
 
-        if normalized_wake in normalized_text:
-            return True
-
         text_tokens = normalized_text.split()
         wake_tokens = normalized_wake.split()
 
+        if normalized_wake in normalized_text:
+            # During TTS, require phrase near beginning or as a short utterance to reduce speaker echo triggers.
+            return self._wake_phrase_position_ok(text_tokens, wake_tokens, strict=self._tts_active)
+
         if len(wake_tokens) == 2:
             first, second = wake_tokens
+            first_min = WAKE_TTS_FIRST_TOKEN_MIN if self._tts_active else WAKE_IDLE_FIRST_TOKEN_MIN
+            second_min = WAKE_TTS_SECOND_TOKEN_MIN if self._tts_active else WAKE_IDLE_SECOND_TOKEN_MIN
+            max_gap = WAKE_TTS_MAX_GAP_TOKENS if self._tts_active else WAKE_IDLE_MAX_GAP_TOKENS
             for i, token in enumerate(text_tokens):
-                if not self._token_close(token, first):
+                if not self._token_close(token, first, min_ratio=first_min):
                     continue
-                window = text_tokens[i + 1 : i + 4]
+                if self._tts_active and i > WAKE_TTS_PREFIX_TOKEN_LIMIT:
+                    continue
+                window = text_tokens[i + 1 : i + 1 + max_gap]
                 if any(
-                    token2 == second or SequenceMatcher(None, token2, second).ratio() >= 0.63
+                    token2 == second or SequenceMatcher(None, token2, second).ratio() >= second_min
                     for token2 in window
                 ):
                     return True
@@ -211,6 +243,20 @@ class WakeWordDetector:
         return SequenceMatcher(None, normalized_text, normalized_wake).ratio() >= 0.84
 
     @staticmethod
-    def _token_close(a: str, b: str) -> bool:
-        return a == b or SequenceMatcher(None, a, b).ratio() >= 0.74
+    def _token_close(a: str, b: str, min_ratio: float) -> bool:
+        return a == b or SequenceMatcher(None, a, b).ratio() >= min_ratio
+
+    @staticmethod
+    def _wake_phrase_position_ok(text_tokens: list[str], wake_tokens: list[str], strict: bool) -> bool:
+        if not text_tokens or not wake_tokens:
+            return False
+        n = len(wake_tokens)
+        for i in range(0, max(0, len(text_tokens) - n + 1)):
+            if text_tokens[i:i + n] != wake_tokens:
+                continue
+            if not strict:
+                return True
+            # Strict mode (TTS active): only accept short utterances or phrase near the beginning.
+            return len(text_tokens) <= n + 2 or i <= 1
+        return False
 

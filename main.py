@@ -2,13 +2,17 @@
 TalkingMAC — Retro Macintosh AI Assistant
 ==========================================
 
-Entry point.  Wires all subsystems together.
+Entry point. Wires all subsystems together.
 
-Run:
+Run from terminal:
     python3 main.py
     AI_BACKEND=gemini python3 main.py
+    LLM_INTERACTION_MODE=tools python3 main.py
+    UI_WINDOW_MODE=windowed UI_WINDOW_WIDTH=1200 UI_WINDOW_HEIGHT=760 python3 main.py
 
-PyCharm: set main.py as run target.
+Run from PyCharm:
+    Set `main.py` as run target, then set Environment variables, for example:
+    AI_BACKEND=ollama;LLM_INTERACTION_MODE=chat;UI_WINDOW_MODE=fullscreen
 """
 
 import logging
@@ -124,11 +128,13 @@ class TalkingMACAssistant:
 
     def _on_tts_start(self):
         """Called by TTS worker thread the moment audio starts playing."""
+        self._ww.set_tts_active(True)
         self._ui.set_expression(Expression.TALKING)
         self._ui.set_mode_label("TALKING")
 
     def _on_tts_end(self):
         """Called by TTS worker thread when audio finishes."""
+        self._ww.set_tts_active(False)
         self._ui.set_expression(Expression.IDLE)
         self._ui.set_mode_label("IDLE")
 
