@@ -17,6 +17,8 @@ Run from PyCharm:
 
 import logging
 import os
+import queue
+import re
 import sys
 import threading
 import time
@@ -53,9 +55,8 @@ class TalkingMACAssistant:
         LISTENING (face listens, STT records)
           ↓
         THINKING (LLM generating)
-          ↓  first token received
-        [wait for LLM to finish streaming]
-          ↓  TTS starts playing
+          ↓  first chunk received
+        TALKING (TTS starts while stream continues)
         TALKING  ← face animates mouth while audio plays
           ↓  TTS finishes
         IDLE
@@ -94,6 +95,16 @@ class TalkingMACAssistant:
         self._sleeping = False
         self._sleep_timeout_secs = max(0.0, IDLE_SLEEP_TIMEOUT_SECS)
         self._stop_event = threading.Event()
+
+        # Streaming TTS chunking tuned for low-latency but natural phrasing.
+        self._tts_stream_sentence_split = re.compile(r"(?<=[.!?])\s+|(?<=[,;:])\s+(?=[A-Z0-9])")
+        self._tts_stream_soft_chunk_chars = 120
+        self._tts_stream_hard_chunk_chars = 170
+        self._tts_stream_min_first_chunk_chars = 48
+        self._tts_stream_min_partial_chunk_chars = 32
+        self._tts_stream_partial_flush_interval_secs = 0.35
+        self._tts_stream_coalesce_window_secs = 0.12
+        self._tts_stream_coalesce_target_chars = 210
 
     # ── Boot ──────────────────────────────────────────────────────────────────
 
@@ -232,6 +243,18 @@ class TalkingMACAssistant:
         self._set_state(Expression.THINKING, "THINKING")
         self._ui.show_status("", ttl=0)
 
+        tts_queue: queue.Queue[str | None] = queue.Queue()
+        tts_worker = threading.Thread(
+            target=self._stream_tts_worker,
+            args=(tts_queue,),
+            daemon=True,
+            name="StreamingTTS",
+        )
+        tts_worker.start()
+        tts_buffer = ""
+        has_spoken_chunk = False
+        last_tts_emit_ts = time.monotonic()
+
         try:
             full_response = ""
             for chunk in self._llm.chat_stream(user_text):
@@ -240,6 +263,37 @@ class TalkingMACAssistant:
                     self._set_state(Expression.IDLE, "IDLE")
                     return
                 full_response += chunk
+
+                tts_buffer += chunk
+                ready_chunks, tts_buffer = self._extract_tts_chunks(tts_buffer)
+                if not ready_chunks:
+                    now = time.monotonic()
+                    buffered = tts_buffer.strip()
+                    min_chars = (
+                        self._tts_stream_min_partial_chunk_chars
+                        if has_spoken_chunk
+                        else self._tts_stream_min_first_chunk_chars
+                    )
+                    can_force_emit = (
+                        buffered
+                        and len(buffered) >= min_chars
+                        and (now - last_tts_emit_ts) >= self._tts_stream_partial_flush_interval_secs
+                        and tts_queue.qsize() <= 2
+                    )
+                    if can_force_emit:
+                        ready_chunks = [buffered]
+                        tts_buffer = ""
+
+                for spoken_chunk in ready_chunks:
+                    tts_queue.put(spoken_chunk)
+                    has_spoken_chunk = True
+                    last_tts_emit_ts = time.monotonic()
+
+            tail_chunks, tts_buffer = self._extract_tts_chunks(tts_buffer, flush=True)
+            for spoken_chunk in tail_chunks:
+                tts_queue.put(spoken_chunk)
+                has_spoken_chunk = True
+                last_tts_emit_ts = time.monotonic()
 
             if not full_response.strip():
                 raise ValueError("Empty LLM response")
@@ -253,15 +307,87 @@ class TalkingMACAssistant:
             time.sleep(2)
             self._set_state(Expression.IDLE, "IDLE")
             return
+        finally:
+            tts_queue.put(None)
+            tts_worker.join(timeout=60)
 
-        # ── Speak (TTS callbacks drive TALKING ↔ IDLE transitions) ───────────
-        # Face goes TALKING exactly when audio starts via on_tts_start callback
+        # ── Streaming speak complete ─────────────────────────────────────────
         if self._interrupt_requested.is_set():
             log.info("Response interrupted before speaking")
             self._set_state(Expression.IDLE, "IDLE")
             return
-        self._tts.speak(full_response)
         # on_tts_end callback already set face back to IDLE
+
+    def _extract_tts_chunks(self, text_buffer: str, flush: bool = False) -> tuple[list[str], str]:
+        """Split model stream text into speakable chunks without waiting for full completion."""
+        normalized = text_buffer.replace("\r\n", "\n").replace("\n\n", ". ")
+        parts = self._tts_stream_sentence_split.split(normalized)
+        chunks: list[str] = []
+
+        if len(parts) > 1:
+            chunks.extend(p.strip() for p in parts[:-1] if p.strip())
+            remainder = parts[-1]
+        else:
+            remainder = normalized
+
+        remainder_clean = remainder.strip()
+        if flush:
+            if remainder_clean:
+                chunks.append(remainder_clean)
+            return chunks, ""
+
+        # Fallback chunking for long punctuation-free outputs.
+        if len(remainder_clean) >= self._tts_stream_hard_chunk_chars:
+            split_at = remainder_clean.rfind(" ", 0, self._tts_stream_soft_chunk_chars)
+            if split_at <= 0:
+                split_at = self._tts_stream_soft_chunk_chars
+            chunks.append(remainder_clean[:split_at].strip())
+            remainder = remainder_clean[split_at:].lstrip()
+
+        return chunks, remainder
+
+    def _stream_tts_worker(self, tts_queue: "queue.Queue[str | None]"):
+        stop_after_speak = False
+        while not self._interrupt_requested.is_set():
+            try:
+                payload = tts_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if payload is None:
+                return
+            if not payload.strip() or self._interrupt_requested.is_set():
+                continue
+
+            # Coalesce tiny neighboring chunks to avoid choppy start/stop prosody.
+            merged = payload.strip()
+            deadline = time.monotonic() + self._tts_stream_coalesce_window_secs
+            while (
+                len(merged) < self._tts_stream_coalesce_target_chars
+                and not re.search(r"[.!?][\"')\]]?\s*$", merged)
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    nxt = tts_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+
+                if nxt is None:
+                    stop_after_speak = True
+                    break
+
+                nxt = nxt.strip()
+                if not nxt:
+                    continue
+                if merged and not merged.endswith((" ", "\n")) and not nxt.startswith((".", ",", "!", "?", ";", ":")):
+                    merged += " "
+                merged += nxt
+
+            self._tts.speak(merged)
+            if stop_after_speak:
+                return
 
     # ── Greeting ──────────────────────────────────────────────────────────────
 
